@@ -33,6 +33,24 @@ RET 0: 0, 1, 2 or 8, the lower bound over joins and over returns. It counts
 defined bytes and does not establish a source-language type. It is None when no
 RET is reachable, which describes the reachable control flow and makes no
 termination claim. The generated source states the width unless it is 8.
+
+A function may keep a fixed stack frame. RSP is tracked as a constant offset from
+its entry value at every instruction; only PUSH and POP of a 64-bit register and
+SUB or ADD of RSP with an immediate change it, paths must meet with the same
+offset, and every RET must see offset 0. [RSP+disp] loads and stores become
+offsets into one byte array per invocation. Accessed bytes must lie at or above
+the current RSP, below the return address or in the caller's 32-byte home area
+above it; the return-address slot, stack arguments, RSP as an index and any
+other use of a frame address (LEA, a register copy of RSP) are refused. Frame
+bytes are defined per path like registers: a read needs every byte it reads
+written on every incoming path, and the home area starts undefined.
+
+The nonvolatile registers (RBX, RBP, RSI, RDI, R12-R15) start holding the
+caller's value, which the translation does not reproduce. A PUSH of such a
+register saves it, and the POP of that slot into the same register restores it.
+Reading a caller's value other than to save it is refused, as is a read of a
+saved slot other than its restore, and every RET must see each nonvolatile
+register restored. Calls remain refused, so no frame address crosses a call.
 """
 
 import argparse
@@ -40,8 +58,8 @@ from pathlib import Path
 import struct
 
 import pefile
-from iced_x86 import (ConditionCode as CC, Decoder, FlowControl, MemorySizeExt, Mnemonic as M, OpKind,
-                      Register as R, RegisterExt)
+from iced_x86 import (ConditionCode as CC, Decoder, FlowControl, InstructionInfoFactory, MemorySizeExt,
+                      Mnemonic as M, OpAccess, OpKind, Register as R, RegisterExt)
 
 from cpu_leaf_aot import export_rva
 from cpu_ranges import function_ranges, image_bytes
@@ -55,6 +73,10 @@ ARGUMENT_REGISTERS = (R.RCX, R.RDX, R.R8, R.R9)
 ARGUMENT_COUNTS = (3, 4)
 DEFAULT_ARGUMENTS = 3
 VOLATILE = {R.RAX, R.RCX, R.RDX, R.R8, R.R9, R.R10, R.R11}
+NONVOLATILE = set(NAMES) - VOLATILE - {R.RSP}
+# Offsets from entry RSP: the return address occupies [0, 8) and the caller's home area [8, 40).
+HOME_BEGIN, HOME_END = 8, 40
+MAX_FRAME = 1 << 16
 HIGH_BYTES = {R.AH, R.BH, R.CH, R.DH}
 ALU = {M.ADD: "+", M.SUB: "-", M.AND: "&", M.OR: "|", M.XOR: "^"}
 SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
@@ -74,6 +96,11 @@ MAX_INSTRUCTIONS = 4096
 
 def unsigned(width):
     return f"std::uint{width * 8}_t"
+
+
+def to_signed(value, bits=64):
+    value &= (1 << bits) - 1
+    return value - (1 << bits) if value >> (bits - 1) else value
 
 
 def signed(width):
@@ -333,19 +360,34 @@ class Function:
 
 
 class Lifter:
-    def __init__(self):
+    def __init__(self, offsets=None, frame_base=0):
         self.used = set()
         self.flags = False
+        # Stack offset before each instruction, and the offset that frame[0] stands for.
+        self.offsets = offsets or {}
+        self.frame_base = frame_base
+        self.frame = False
 
     def reg(self, register):
         width = RegisterExt.size(register)
         if register in HIGH_BYTES or width not in (1, 2, 4, 8):
             raise ValueError(f"unsupported register {register}")
+        if full(register) == R.RSP:
+            raise ValueError("frame address escapes through rsp")
         name = NAMES[full(register)]
         self.used.add(full(register))
         return name if width == 8 else f"static_cast<{unsigned(width)}>({name})"
 
+    def slot(self, offset):
+        """The host address of the frame byte at the given offset from entry RSP."""
+        self.frame = True
+        return f"(fp + {offset - self.frame_base:#x}ull)"
+
     def address(self, ins):
+        if ins.memory_base == R.RSP and ins.memory_index == R.NONE and not ins.has_segment_prefix:
+            if ins.mnemonic == M.LEA:
+                raise ValueError(f"frame address escapes at RVA {ins.ip:#x}")
+            return self.slot(self.offsets[ins.ip] + to_signed(ins.memory_displacement))
         if (ins.memory_base in (R.RIP, R.EIP, R.RSP, R.ESP) or ins.memory_index in (R.RSP, R.ESP)
                 or ins.has_segment_prefix or ins.memory_base == R.NONE):
             raise ValueError(f"unsupported memory operand at RVA {ins.ip:#x}")
@@ -442,7 +484,8 @@ class Lifter:
                     read(ins.op_register(number))
                 elif kind == OpKind.MEMORY:
                     for register in (ins.memory_base, ins.memory_index):
-                        if register != R.NONE:
+                        # An RSP base addresses the frame, whose bytes the definedness pass checks.
+                        if register not in (R.NONE, R.RSP):
                             read(register)
 
         if ins.op_count and ins.op0_kind == OpKind.REGISTER:
@@ -575,6 +618,81 @@ def flag_producer(function, edges, consumer):
     raise ValueError(f"flag producer too far before RVA {consumer.ip:#x}")
 
 
+def is_stack_adjust(ins):
+    return (ins.mnemonic in (M.SUB, M.ADD) and ins.op_count == 2 and ins.op0_kind == OpKind.REGISTER
+            and ins.op0_register == R.RSP)
+
+
+def stack_offsets(function):
+    """RSP before each reachable instruction, as a constant offset from its value at entry."""
+    offsets = {function.entry: 0}
+    work = [function.entry]
+    while work:
+        ip = work.pop()
+        ins = function.instructions[ip]
+        offset = after = offsets[ip]
+        if ins.mnemonic in (M.PUSH, M.POP):
+            if ins.op0_kind != OpKind.REGISTER or not RegisterExt.is_gpr64(ins.op0_register) \
+                    or ins.op0_register == R.RSP:
+                raise ValueError(f"unsupported stack operation at RVA {ip:#x}: {ins}")
+            after += -8 if ins.mnemonic == M.PUSH else 8
+        elif is_stack_adjust(ins):
+            if ins.op1_kind not in (OpKind.IMMEDIATE8TO64, OpKind.IMMEDIATE32TO64):
+                raise ValueError(f"stack pointer write at RVA {ip:#x}: {ins}")
+            amount = to_signed(ins.immediate(1))
+            after += -amount if ins.mnemonic == M.SUB else amount
+        elif ins.mnemonic == M.RET:
+            pass
+        elif ins.is_stack_instruction or (ins.op_count and ins.op0_kind == OpKind.REGISTER
+                                          and full(ins.op0_register) == R.RSP and ins.mnemonic not in (M.CMP, M.TEST)):
+            raise ValueError(f"stack pointer write at RVA {ip:#x}: {ins}")
+        if not -MAX_FRAME <= after <= 0 or after % 8:
+            raise ValueError(f"unsupported stack offset {after} after RVA {ip:#x}")
+        for successor in function.successors[ip]:
+            if successor not in offsets:
+                offsets[successor] = after
+                work.append(successor)
+            elif offsets[successor] != after:
+                raise ValueError(f"stack offset differs at join RVA {successor:#x}: "
+                                 f"{offsets[successor]} and {after}")
+    # Checked once every path has been walked, so a mismatched join is reported as such
+    # whichever path reaches a RET first.
+    for ip in sorted(offsets):
+        if function.instructions[ip].mnemonic == M.RET and offsets[ip] != 0:
+            raise ValueError(f"stack offset {offsets[ip]} at RET at RVA {ip:#x}")
+    return offsets
+
+
+_INFO = InstructionInfoFactory()
+
+
+def frame_accesses(ins, offset):
+    """(kind, frame offset, width) for each RSP-based memory access of one instruction."""
+    accesses = []
+    for memory in _INFO.info(ins).used_memory():
+        if R.RSP not in (memory.base, memory.index) and R.ESP not in (memory.base, memory.index):
+            continue
+        if memory.base != R.RSP or memory.index != R.NONE or ins.has_segment_prefix:
+            raise ValueError(f"unsupported memory operand at RVA {ins.ip:#x}")
+        if memory.access == OpAccess.NO_MEM_ACCESS:
+            raise ValueError(f"frame address escapes at RVA {ins.ip:#x}")
+        width = MemorySizeExt.size(memory.memory_size)
+        at = offset + to_signed(memory.displacement)
+        if at < offset:
+            raise ValueError(f"frame access below the stack pointer at RVA {ins.ip:#x}")
+        if at < HOME_BEGIN and at + width > 0:
+            raise ValueError(f"return address slot accessed at RVA {ins.ip:#x}")
+        if at + width > HOME_END:
+            raise ValueError(f"stack argument accessed at RVA {ins.ip:#x}")
+        if memory.access in (OpAccess.READ, OpAccess.COND_READ, OpAccess.READ_WRITE, OpAccess.READ_COND_WRITE):
+            accesses.append(("read", at, width))
+        if memory.access in (OpAccess.WRITE, OpAccess.READ_WRITE):
+            accesses.append(("write", at, width))
+        elif memory.access in (OpAccess.COND_WRITE, OpAccess.READ_COND_WRITE):
+            raise ValueError(f"conditional frame write at RVA {ins.ip:#x}")
+    return accesses
+
+
 def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
     """Translate one export that takes the given number of integer arguments, 3 or 4."""
     if not isinstance(arguments, int) or arguments not in ARGUMENT_COUNTS:
@@ -583,11 +701,19 @@ def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
     function = Function(pe, entry)
     function.arguments = ARGUMENT_REGISTERS[:arguments]
     edges = function.explore()
-    lifter = Lifter()
+    offsets = stack_offsets(function)
+    lowest = min(offsets.values())
+    # Entry RSP is 8 mod 16 after the caller's CALL. frame[0] stands for an offset that is also
+    # 8 mod 16, so the 16-byte-aligned array gives every slot its native alignment.
+    frame_base = lowest - (lowest - HOME_BEGIN) % 16
+    lifter = Lifter(offsets, frame_base)
     order = sorted(function.instructions)
     instructions = function.instructions
     producers = {ip: flag_producer(function, edges, ins) for ip, ins in instructions.items()
                  if ins.flow_control == FlowControl.CONDITIONAL_BRANCH or ins.mnemonic in SETCC | CMOVCC}
+    for producer in producers.values():
+        if is_stack_adjust(producer):
+            raise ValueError(f"flags of a stack adjustment are read after RVA {producer.ip:#x}")
     sets_flags = {producer.ip for producer in producers.values()}
     loads = {sequence[0]: index for index, _, sequence, _, _, _ in function.dispatches.values()}
     skipped = {ip for _, _, sequence, _, _, _ in function.dispatches.values() for ip in sequence}
@@ -600,10 +726,24 @@ def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
         body[ip] = ""
         if ins.flow_control == FlowControl.CONDITIONAL_BRANCH:
             body[ip] = f"if ({lifter.condition(producers[ip], ins)}) goto loc_{ins.near_branch_target:x};"
-            effects[ip] = ({}, {}, set())
+            effects[ip] = ({}, {}, set(), [])
         elif ins.flow_control == FlowControl.UNCONDITIONAL_BRANCH:
             body[ip] = f"goto loc_{ins.near_branch_target:x};"
-            effects[ip] = ({}, {}, set())
+            effects[ip] = ({}, {}, set(), [])
+        elif ins.mnemonic in (M.PUSH, M.POP):
+            register = full(ins.op0_register)
+            name_ = lifter.reg(register)
+            if ins.mnemonic == M.PUSH:
+                at = offsets[ip] - 8
+                body[ip] = f"store<std::uint64_t>({lifter.slot(at)}, {name_});"
+                effects[ip] = ({register: 8}, {}, set(), [("push", at, register)])
+            else:
+                at = offsets[ip]
+                body[ip] = f"{name_} = load<std::uint64_t>({lifter.slot(at)});"
+                effects[ip] = ({}, {}, set(), [("pop", at, register)])
+        elif is_stack_adjust(ins):
+            # The offset pass accounts for the adjustment; the frame array needs no code.
+            effects[ip] = ({}, {}, set(), [])
         elif ip in function.dispatches:
             index, targets, _, _, target, _ = function.dispatches[ip]
             cases = {}
@@ -616,51 +756,95 @@ def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
             lines += ["    default: std::abort();", "}"]
             body[ip] = "\n    ".join(lines)
             # The guest jump target has no host meaning after the dispatch.
-            effects[ip] = ({}, {}, {target})
+            effects[ip] = ({}, {}, {target}, [])
         elif ip in skipped:
             # The table load reads the 64-bit index; it and the add leave guest addresses behind.
-            effects[ip] = ({loads[ip]: 8} if ip in loads else {}, {}, {full(ins.op0_register)})
+            effects[ip] = ({loads[ip]: 8} if ip in loads else {}, {}, {full(ins.op0_register)}, [])
         elif ins.mnemonic == M.LEA and ins.is_ip_rel_memory_operand and RegisterExt.is_gpr64(ins.op0_register):
             # A guest address is only usable as a jump-table base, which the switch replaces.
-            effects[ip] = ({}, {}, {full(ins.op0_register)})
+            effects[ip] = ({}, {}, {full(ins.op0_register)}, [])
         else:
-            if ins.mnemonic != M.RET and ins.is_stack_instruction:
-                raise ValueError(f"stack operation in leaf profile at RVA {ip:#x}")
+            # RET reads the return address, which the translation does not model.
+            frame = [] if ins.mnemonic == M.RET else frame_accesses(ins, offsets[ip])
             text, reads, writes = lifter.statement(ins, ip in sets_flags, producers.get(ip))
             body[ip] = text
-            effects[ip] = (reads, writes, set())
-        touched = set().union(*effects[ip])
-        if touched - VOLATILE:
-            raise ValueError(f"nonvolatile register {NAMES[min(touched - VOLATILE)]} at RVA {ip:#x}")
+            effects[ip] = (reads, writes, set(), frame)
 
     # Per register: (low bytes defined on every path: 0, 1, 2 or 8; may hold a guest address that
-    # the translation does not reproduce). Arguments are defined at entry; joins meet as (min, or).
-    state = {ip: dict.fromkeys(NAMES, (8, False)) for ip in order}
-    state[entry] = {r: (8 if r in function.arguments else 0, False) for r in NAMES}
+    # the translation does not reproduce; still holds the caller's value). Per frame byte: written
+    # on every path ("defined"), or holding the caller's value of a register saved by PUSH. Arguments
+    # are defined at entry and the nonvolatile registers hold the caller's values; joins meet as
+    # (min, or, and), and a frame byte survives a join only when both paths agree on it.
+    def transfer(regs_in, slots_in, ip):
+        reads, writes, kills, frame = effects[ip]
+        regs, slots = dict(regs_in), dict(slots_in)
+        for r, width in writes.items():
+            # A 32- or 64-bit write defines all eight bytes; an 8- or 16-bit write keeps the rest.
+            regs[r] = (8, False, False) if width >= 4 else (max(regs[r][0], width), regs[r][1], False)
+        for r in kills:
+            regs[r] = (0, True, False)
+        for kind, at, extra in frame:
+            if kind == "write":
+                slots.update(dict.fromkeys(range(at, at + extra), "defined"))
+            elif kind == "push":
+                tag = ("saved", extra) if regs_in[extra][2] else "defined"
+                slots.update(dict.fromkeys(range(at, at + 8), tag))
+            elif kind == "pop":
+                tags = {slots_in.get(b) for b in range(at, at + 8)}
+                regs[extra] = ((0, False, True) if tags == {("saved", extra)} else
+                               (8, False, False) if tags == {"defined"} else (0, False, False))
+        return regs, slots
+
+    state = dict.fromkeys(order)
+    state[entry] = ({r: (8 if r in function.arguments else 0, False, r in NONVOLATILE) for r in NAMES}, {})
     changed = True
     while changed:
         changed = False
         for ip in order:
-            _, writes, kills = effects[ip]
-            out = dict(state[ip])
-            for r, width in writes.items():
-                # A 32- or 64-bit write defines all eight bytes; an 8- or 16-bit write keeps the rest.
-                out[r] = (8, False) if width >= 4 else (max(out[r][0], width), out[r][1])
-            for r in kills:
-                out[r] = (0, True)
+            if state[ip] is None:
+                continue
+            regs, slots = transfer(*state[ip], ip)
             for successor in function.successors[ip]:
                 old = state[successor]
-                merged = {r: (min(old[r][0], out[r][0]), old[r][1] or out[r][1]) for r in NAMES}
+                if old is None:
+                    merged = (regs, slots)
+                else:
+                    merged = ({r: (min(old[0][r][0], regs[r][0]), old[0][r][1] or regs[r][1],
+                                   old[0][r][2] and regs[r][2]) for r in NAMES},
+                              {b: tag for b, tag in old[1].items() if slots.get(b) == tag})
                 if merged != old:
                     state[successor] = merged
                     changed = True
     widths = []
     for ip in order:
-        missing = [r for r, width in effects[ip][0].items() if state[ip][r][0] < width]
+        regs, slots = state[ip]
+        reads, _, _, frame = effects[ip]
+        saving = {extra for kind, _, extra in frame if kind == "push" and regs[extra][2]}
+        missing = [r for r, width in reads.items() if r not in saving and regs[r][0] < width]
         if missing:
-            raise ValueError(f"undefined register {NAMES[min(missing)]} at RVA {ip:#x}")
+            r = min(missing)
+            if regs[r][2]:
+                raise ValueError(f"nonvolatile register {NAMES[r]} holds the caller's value at RVA {ip:#x}")
+            raise ValueError(f"undefined register {NAMES[r]} at RVA {ip:#x}")
+        for kind, at, extra in frame:
+            if kind in ("write", "push") and any(regs[r][1] for r in reads):
+                raise ValueError(f"guest address stored in the frame at RVA {ip:#x}")
+            if kind == "read":
+                tags = [slots.get(b) for b in range(at, at + extra)]
+                if any(isinstance(tag, tuple) for tag in tags):
+                    raise ValueError(f"saved register slot read at RVA {ip:#x}")
+                if None in tags:
+                    raise ValueError(f"undefined frame bytes at offset {at} at RVA {ip:#x}")
+            elif kind == "pop":
+                tags = {slots.get(b) for b in range(at, at + 8)}
+                if tags != {"defined"} and tags != {("saved", extra)}:
+                    what = "undefined frame bytes" if None in tags else "another register's save slot"
+                    raise ValueError(f"pop of {NAMES[extra]} reads {what} at RVA {ip:#x}")
         if instructions[ip].mnemonic == M.RET:
-            defined, guest = state[ip][R.RAX]
+            for r in sorted(NONVOLATILE, key=lambda r: NAMES[r]):
+                if not regs[r][2]:
+                    raise ValueError(f"nonvolatile register {NAMES[r]} is not restored at RET at RVA {ip:#x}")
+            defined, guest, _ = regs[R.RAX]
             if guest:
                 raise ValueError(f"return value may hold a guest address at RVA {ip:#x}")
             widths.append(defined)
@@ -681,6 +865,10 @@ def lift(pe, name, arguments=DEFAULT_ARGUMENTS):
     declarations = [f"word {NAMES[r]} = 0;" for r in locals_]
     if lifter.flags:
         declarations.append("word fa = 0, fb = 0;")
+    if lifter.frame:
+        # One frame per invocation: the deepest offset reached up to the end of the home area.
+        declarations.append(f"alignas(16) unsigned char frame[{HOME_END - frame_base:#x}] = {{}};")
+        declarations.append("const word fp = reinterpret_cast<word>(frame);")
     text = [f"    goto loc_{entry:x};"] if order[0] != entry else []
     for position, ip in enumerate(order):
         if ip in labels:
